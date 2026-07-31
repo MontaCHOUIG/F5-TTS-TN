@@ -5,6 +5,7 @@ runs/
 data/
 ckpts/
 wandb/
+mlruns/
 results/
 
 # Byte-compiled / optimized / DLL files

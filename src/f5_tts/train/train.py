@@ -1,10 +1,13 @@
 # training script.
 
+import json
 import os
+from glob import glob
 from importlib.resources import files
 
 import hydra
 from omegaconf import OmegaConf
+from safetensors import safe_open
 
 from f5_tts.model import CFM, Trainer
 from f5_tts.model.dataset import load_dataset
@@ -35,6 +38,40 @@ def main(model_cfg):
         tokenizer_path = model_cfg.model.tokenizer_path
     vocab_char_map, vocab_size = get_tokenizer(tokenizer_path, tokenizer)
 
+    checkpoint_path = str(files("f5_tts").joinpath(f"../../{model_cfg.ckpts.save_dir}"))
+    if model_cfg.model.name == "F5TTS_v1_Base_TUN":
+        with open(
+            str(files("f5_tts").joinpath(f"../../data/{model_cfg.datasets.name}_{tokenizer}/vocab.txt")),
+            "r",
+            encoding="utf-8",
+        ) as vocab_file:
+            vocab_rows = sum(1 for _ in vocab_file)
+        checkpoint_candidates = sorted(glob(os.path.join(checkpoint_path, "pretrained_*.safetensors")))
+        checkpoint_shapes = {}
+        for candidate in checkpoint_candidates:
+            with safe_open(candidate, framework="pt", device="cpu") as checkpoint:
+                checkpoint_shapes[candidate] = {
+                    key: list(checkpoint.get_slice(key).get_shape())
+                    for key in checkpoint.keys()
+                    if key.endswith("text_embed.text_embed.weight")
+                }
+        audit = {
+            "event": "trainer_tokenizer_audit",
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_candidates": checkpoint_candidates,
+            "checkpoint_embedding_shapes": checkpoint_shapes,
+            "dataset": model_cfg.datasets.name,
+            "tokenizer": tokenizer,
+            "tokenizer_path_argument": str(tokenizer_path),
+            "vocab_rows": vocab_rows,
+            "effective_vocab_size": vocab_size,
+            "resolved_model_config": OmegaConf.to_container(model_cfg.model, resolve=True),
+        }
+        os.makedirs(checkpoint_path, exist_ok=True)
+        with open(os.path.join(checkpoint_path, "habibi_trainer_audit.jsonl"), "a", encoding="utf-8") as audit_file:
+            audit_file.write(json.dumps(audit, ensure_ascii=False, sort_keys=True) + "\n")
+        print("HABIBI TRAINER AUDIT: " + json.dumps(audit, ensure_ascii=False, sort_keys=True))
+
     # set model
     model = CFM(
         transformer=model_cls(**model_arc, text_num_embeds=vocab_size, mel_dim=model_cfg.model.mel_spec.n_mel_channels),
@@ -50,7 +87,7 @@ def main(model_cfg):
         num_warmup_updates=model_cfg.optim.num_warmup_updates,
         save_per_updates=model_cfg.ckpts.save_per_updates,
         keep_last_n_checkpoints=model_cfg.ckpts.keep_last_n_checkpoints,
-        checkpoint_path=str(files("f5_tts").joinpath(f"../../{model_cfg.ckpts.save_dir}")),
+        checkpoint_path=checkpoint_path,
         batch_size_per_gpu=model_cfg.datasets.batch_size_per_gpu,
         batch_size_type=model_cfg.datasets.batch_size_type,
         max_samples=model_cfg.datasets.max_samples,

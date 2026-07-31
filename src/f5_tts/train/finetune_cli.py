@@ -27,7 +27,7 @@ def parse_args():
         "--exp_name",
         type=str,
         default="F5TTS_v1_Base",
-        choices=["F5TTS_v1_Base", "F5TTS_Base", "E2TTS_Base"],
+        choices=["F5TTS_v1_Base", "F5TTS_v1_Base_TUN", "F5TTS_Base", "E2TTS_Base"],
         help="Experiment name",
     )
     parser.add_argument("--dataset_name", type=str, default="Emilia_ZH_EN", help="Name of the dataset to use")
@@ -51,6 +51,12 @@ def parse_args():
     parser.add_argument("--last_per_updates", type=int, default=5000, help="Save last checkpoint every N updates")
     parser.add_argument("--finetune", action="store_true", help="Use Finetune")
     parser.add_argument("--pretrain", type=str, default=None, help="the path to the checkpoint")
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Optional checkpoint output directory; defaults to ckpts/<dataset_name>",
+    )
     parser.add_argument(
         "--tokenizer", type=str, default="pinyin", choices=["pinyin", "char", "custom"], help="Tokenizer type"
     )
@@ -81,11 +87,11 @@ def parse_args():
 def main():
     args = parse_args()
 
-    checkpoint_path = str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}"))
+    checkpoint_path = args.checkpoint_dir or str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}"))
 
     # Model parameters based on experiment name
 
-    if args.exp_name == "F5TTS_v1_Base":
+    if args.exp_name in ("F5TTS_v1_Base", "F5TTS_v1_Base_TUN"):
         wandb_resume_id = None
         model_cls = DiT
         model_cfg = dict(
@@ -98,7 +104,12 @@ def main():
         )
         if args.finetune:
             if args.pretrain is None:
-                ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors"))
+                if args.exp_name == "F5TTS_v1_Base_TUN":
+                    ckpt_path = str(
+                        cached_path("hf://SWivid/Habibi-TTS/Specialized/MSA/model_200000.safetensors")
+                    )
+                else:
+                    ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors"))
             else:
                 ckpt_path = args.pretrain
 

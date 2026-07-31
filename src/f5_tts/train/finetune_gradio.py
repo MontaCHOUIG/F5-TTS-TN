@@ -1,5 +1,6 @@
 import gc
 import json
+import math
 import os
 import platform
 import queue
@@ -25,6 +26,7 @@ import torchaudio
 from cached_path import cached_path
 from datasets import Dataset as Dataset_
 from datasets.arrow_writer import ArrowWriter
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from scipy.io import wavfile
 
@@ -57,10 +59,14 @@ last_checkpoint = ""
 last_device = ""
 last_ema = None
 
+HABIBI_TUN_EXP_NAME = "F5TTS_v1_Base_TUN"
+HABIBI_TUN_DATASET = "TunisianTTS"
+HABIBI_TUN_CHECKPOINT_DIR = f"{HABIBI_TUN_EXP_NAME}_vocos_char_{HABIBI_TUN_DATASET}"
 
 path_data = str(files("f5_tts").joinpath("../../data"))
 path_project_ckpts = str(files("f5_tts").joinpath("../../ckpts"))
 file_train = str(files("f5_tts").joinpath("train/finetune_cli.py"))
+file_train_hydra = str(files("f5_tts").joinpath("train/train.py"))
 
 device = (
     "cuda"
@@ -71,6 +77,53 @@ device = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
+
+
+def validate_habibi_checkpoint_vocab(checkpoint_path: str, vocab_path: str) -> None:
+    if not checkpoint_path.endswith(".safetensors"):
+        raise ValueError("The Habibi MSA base checkpoint must be a .safetensors file")
+
+    with open(vocab_path, "r", encoding="utf-8") as vocab_file:
+        tokens = [line.rstrip("\r\n") for line in vocab_file]
+    if not tokens or tokens[0] != " ":
+        raise ValueError("The project vocabulary must have a space at token index 0")
+
+    with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+        embedding_keys = [key for key in checkpoint.keys() if key.endswith("text_embed.text_embed.weight")]
+        if not embedding_keys:
+            raise ValueError("No text embedding was found in the Habibi checkpoint")
+        embedding_rows = {checkpoint.get_slice(key).get_shape()[0] for key in embedding_keys}
+    # DiT reserves one additional embedding row for its filler/padding index.
+    expected_embedding_rows = len(tokens) + 1
+    if embedding_rows != {expected_embedding_rows}:
+        raise ValueError(
+            f"Checkpoint text embedding rows {sorted(embedding_rows)} do not match {len(tokens)} vocabulary rows "
+            f"plus DiT's one reserved filler row"
+        )
+
+
+def write_habibi_checkpoint_audit(audit_path: str, event: str, **details) -> None:
+    """Append a machine-readable record of the checkpoint Gradio selected."""
+    record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event, **details}
+    with open(audit_path, "a", encoding="utf-8") as audit_file:
+        audit_file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def inspect_habibi_checkpoint(checkpoint_path: str, vocab_path: str) -> dict:
+    with open(vocab_path, "r", encoding="utf-8") as vocab_file:
+        tokens = [line.rstrip("\r\n") for line in vocab_file]
+    with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+        embedding_keys = [key for key in checkpoint.keys() if key.endswith("text_embed.text_embed.weight")]
+        embedding_shapes = {key: list(checkpoint.get_slice(key).get_shape()) for key in embedding_keys}
+    return {
+        "source_checkpoint": checkpoint_path,
+        "source_checkpoint_realpath": os.path.realpath(checkpoint_path),
+        "vocab_path": vocab_path,
+        "vocab_path_realpath": os.path.realpath(vocab_path),
+        "vocab_rows": len(tokens),
+        "vocab_token_zero": tokens[0] if tokens else None,
+        "embedding_shapes": embedding_shapes,
+    }
 
 
 # Save settings from a JSON file
@@ -156,6 +209,28 @@ def load_settings(project_name):
     }
     if device == "mps":
         default_settings["mixed_precision"] = "none"
+
+    if project_name.casefold() == HABIBI_TUN_DATASET.casefold():
+        default_settings.update(
+            {
+                "exp_name": HABIBI_TUN_EXP_NAME,
+                "learning_rate": 7.5e-5,
+                "batch_size_per_gpu": 9600,
+                "batch_size_type": "frame",
+                "max_samples": 64,
+                "grad_accumulation_steps": 1,
+                "max_grad_norm": 1.0,
+                "epochs": 1,
+                "num_warmup_updates": 20000,
+                "save_per_updates": 50000,
+                "keep_last_n_checkpoints": -1,
+                "last_per_updates": 5000,
+                "finetune": True,
+                "tokenizer_type": "char",
+                "tokenizer_file": "",
+                "mixed_precision": "bf16",
+            }
+        )
 
     # Load settings from file if it exists
     if os.path.isfile(file_setting):
@@ -391,6 +466,110 @@ def start_training(
     if training_process is not None:
         return "Train run already!", gr.update(interactive=False), gr.update(interactive=True)
 
+    if exp_name == HABIBI_TUN_EXP_NAME:
+        expected_project = f"{HABIBI_TUN_DATASET}_char"
+        if dataset_name.casefold() != expected_project.casefold():
+            yield (
+                f"Habibi Tunisian fine-tuning requires the {expected_project} project.",
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+            )
+            return
+        if not finetune:
+            yield (
+                "Enable Finetune for the Habibi MSA warm start.",
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+            )
+            return
+        if tokenizer_file:
+            yield (
+                "Leave Tokenizer File empty. The char tokenizer reads the checkpoint-compatible project vocab.txt.",
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+            )
+            return
+        project_vocab = os.path.join(path_project, "vocab.txt")
+        if not os.path.isfile(project_vocab):
+            yield (
+                f"The checkpoint-compatible MSA vocabulary is missing: {project_vocab}",
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+            )
+            return
+
+        checkpoint_dir = os.path.join(path_project_ckpts, HABIBI_TUN_CHECKPOINT_DIR)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        audit_path = os.path.join(checkpoint_dir, "habibi_checkpoint_audit.jsonl")
+        aligned_checkpoint = os.path.join(checkpoint_dir, "pretrained_msa_project_vocab_compatible.safetensors")
+        source_kind = ""
+        try:
+            if file_checkpoint_train:
+                source_checkpoint = os.path.realpath(file_checkpoint_train)
+                source_kind = "UI Path to the Pretrained Checkpoint"
+            elif os.path.isfile(aligned_checkpoint):
+                source_checkpoint = os.path.realpath(aligned_checkpoint)
+                source_kind = "automatic local vocabulary-aligned checkpoint"
+            else:
+                source_checkpoint = str(
+                    cached_path("hf://SWivid/Habibi-TTS/Specialized/MSA/model_200000.safetensors")
+                )
+                source_kind = "automatic Hugging Face cache fallback"
+            if not os.path.isfile(source_checkpoint):
+                raise FileNotFoundError(source_checkpoint)
+            audit_details = inspect_habibi_checkpoint(source_checkpoint, project_vocab)
+            pretrained_candidates = sorted(glob(os.path.join(checkpoint_dir, "pretrained_*.safetensors")))
+            write_habibi_checkpoint_audit(
+                audit_path,
+                "selected",
+                source_kind=source_kind,
+                checkpoint_directory=checkpoint_dir,
+                pretrained_candidates=pretrained_candidates,
+                **audit_details,
+            )
+            validate_habibi_checkpoint_vocab(source_checkpoint, project_vocab)
+            checkpoint_name = os.path.basename(source_checkpoint)
+            if not checkpoint_name.startswith("pretrained_"):
+                checkpoint_name = f"pretrained_{checkpoint_name}"
+            staged_checkpoint = os.path.join(checkpoint_dir, checkpoint_name)
+
+            other_pretrained = [
+                path
+                for path in glob(os.path.join(checkpoint_dir, "pretrained_*"))
+                if os.path.realpath(path) != os.path.realpath(staged_checkpoint)
+            ]
+            if other_pretrained:
+                listed = ", ".join(other_pretrained)
+                raise ValueError(
+                    "Another pretrained checkpoint is already staged. The trainer would not have a deterministic "
+                    f"source. Keep only {staged_checkpoint} and remove or move: {listed}"
+                )
+            if not os.path.isfile(staged_checkpoint):
+                shutil.copy2(source_checkpoint, staged_checkpoint)
+            write_habibi_checkpoint_audit(
+                audit_path,
+                "staged",
+                source_kind=source_kind,
+                source_checkpoint=source_checkpoint,
+                staged_checkpoint=staged_checkpoint,
+                staged_checkpoint_realpath=os.path.realpath(staged_checkpoint),
+            )
+        except Exception as error:
+            write_habibi_checkpoint_audit(
+                audit_path,
+                "failed",
+                source_kind=source_kind,
+                source_checkpoint=locals().get("source_checkpoint"),
+                error=str(error),
+            )
+            yield (
+                f"Unable to stage the Habibi MSA checkpoint: {error}\nAudit log: {audit_path}",
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+            )
+            return
+        tokenizer_type = "char"
+
     yield "start train", gr.update(interactive=False), gr.update(interactive=False)
 
     # Command to run the training script with the specified arguments
@@ -410,40 +589,53 @@ def start_training(
     else:
         fp16 = ""
 
-    cmd = (
-        f'accelerate launch {fp16} "{file_train}" --exp_name {exp_name}'
-        f" --learning_rate {learning_rate}"
-        f" --batch_size_per_gpu {batch_size_per_gpu}"
-        f" --batch_size_type {batch_size_type}"
-        f" --max_samples {max_samples}"
-        f" --grad_accumulation_steps {grad_accumulation_steps}"
-        f" --max_grad_norm {max_grad_norm}"
-        f" --epochs {epochs}"
-        f" --num_warmup_updates {num_warmup_updates}"
-        f" --save_per_updates {save_per_updates}"
-        f" --keep_last_n_checkpoints {keep_last_n_checkpoints}"
-        f" --last_per_updates {last_per_updates}"
-        f" --dataset_name {dataset_name}"
-    )
+    if exp_name == HABIBI_TUN_EXP_NAME:
+        logger_override = "null" if logger == "none" else logger
+        cmd = (
+            f'accelerate launch {fp16} "{file_train_hydra}" --config-name F5TTS_v1_Base_TUN.yaml'
+            f" ++datasets.batch_size_per_gpu={int(batch_size_per_gpu)}"
+            f" ++datasets.batch_size_type={batch_size_type}"
+            f" ++datasets.max_samples={int(max_samples)}"
+            f" ++optim.epochs={int(epochs)}"
+            f" ++optim.learning_rate={learning_rate}"
+            f" ++optim.num_warmup_updates={int(num_warmup_updates)}"
+            f" ++optim.grad_accumulation_steps={int(grad_accumulation_steps)}"
+            f" ++optim.max_grad_norm={max_grad_norm}"
+            f" ++optim.bnb_optimizer={str(bool(ch_8bit_adam)).lower()}"
+            f" ++ckpts.save_per_updates={int(save_per_updates)}"
+            f" ++ckpts.keep_last_n_checkpoints={int(keep_last_n_checkpoints)}"
+            f" ++ckpts.last_per_updates={int(last_per_updates)}"
+            f" ++ckpts.logger={logger_override}"
+        )
+    else:
+        cmd = (
+            f'accelerate launch {fp16} "{file_train}" --exp_name {exp_name}'
+            f" --learning_rate {learning_rate}"
+            f" --batch_size_per_gpu {batch_size_per_gpu}"
+            f" --batch_size_type {batch_size_type}"
+            f" --max_samples {max_samples}"
+            f" --grad_accumulation_steps {grad_accumulation_steps}"
+            f" --max_grad_norm {max_grad_norm}"
+            f" --epochs {epochs}"
+            f" --num_warmup_updates {num_warmup_updates}"
+            f" --save_per_updates {save_per_updates}"
+            f" --keep_last_n_checkpoints {keep_last_n_checkpoints}"
+            f" --last_per_updates {last_per_updates}"
+            f" --dataset_name {dataset_name}"
+        )
 
-    if finetune:
-        cmd += " --finetune"
-
-    if file_checkpoint_train != "":
-        cmd += f' --pretrain "{file_checkpoint_train}"'
-
-    if tokenizer_file != "":
-        cmd += f" --tokenizer_path {tokenizer_file}"
-
-    cmd += f" --tokenizer {tokenizer_type}"
-
-    if logger != "none":
-        cmd += f" --logger {logger}"
-
-    cmd += " --log_samples"
-
-    if ch_8bit_adam:
-        cmd += " --bnb_optimizer"
+        if finetune:
+            cmd += " --finetune"
+        if file_checkpoint_train != "":
+            cmd += f' --pretrain "{file_checkpoint_train}"'
+        if tokenizer_file != "":
+            cmd += f" --tokenizer_path {tokenizer_file}"
+        cmd += f" --tokenizer {tokenizer_type}"
+        if logger != "none":
+            cmd += f" --logger {logger}"
+        cmd += " --log_samples"
+        if ch_8bit_adam:
+            cmd += " --bnb_optimizer"
 
     print("run command : \n" + cmd + "\n")
 
@@ -614,8 +806,7 @@ def get_list_projects():
         path_folder = os.path.join(path_data, folder)
         if not os.path.isdir(path_folder):
             continue
-        folder = folder.lower()
-        if folder == "emilia_zh_en_pinyin":
+        if folder.casefold() == "emilia_zh_en_pinyin":
             continue
         project_list.append(folder)
 
@@ -859,11 +1050,13 @@ def check_user(value):
 
 def calculate_train(
     name_project,
+    exp_name,
     epochs,
     learning_rate,
     batch_size_per_gpu,
     batch_size_type,
     max_samples,
+    grad_accumulation_steps,
     num_warmup_updates,
     finetune,
 ):
@@ -912,26 +1105,30 @@ def calculate_train(
     # rough estimate of batch size
     if batch_size_type == "frame":
         batch_size_per_gpu = max(int(38400 * (avg_gpu_memory - 5) / 75), int(max_sample_length))
+        if exp_name == HABIBI_TUN_EXP_NAME:
+            batch_size_per_gpu = max(min(batch_size_per_gpu, 9600), int(max_sample_length))
     elif batch_size_type == "sample":
         batch_size_per_gpu = int(200 / (total_duration / total_samples))
 
     if total_samples < 64:
-        max_samples = int(total_samples * 0.25)
+        max_samples = max(1, int(total_samples * 0.25))
 
     num_warmup_updates = max(num_warmup_updates, int(total_samples * 0.05))
 
-    # take 1.2M updates as the maximum
-    max_updates = 1200000
+    max_updates = 200000 if exp_name == HABIBI_TUN_EXP_NAME else 1200000
+    grad_accumulation_steps = max(1, int(grad_accumulation_steps))
 
     if batch_size_type == "frame":
         mini_batch_duration = batch_size_per_gpu * gpu_count * hop_length / sampling_rate
-        updates_per_epoch = total_duration / mini_batch_duration
+        updates_per_epoch = total_duration / mini_batch_duration / grad_accumulation_steps
     elif batch_size_type == "sample":
-        updates_per_epoch = total_samples / batch_size_per_gpu / gpu_count
+        updates_per_epoch = total_samples / batch_size_per_gpu / gpu_count / grad_accumulation_steps
 
-    epochs = int(max_updates / updates_per_epoch)
+    epochs = math.ceil(max_updates / updates_per_epoch)
 
-    if finetune:
+    if exp_name == HABIBI_TUN_EXP_NAME:
+        learning_rate = 7.5e-5
+    elif finetune:
         learning_rate = 1e-5
     else:
         learning_rate = 7.5e-5
@@ -1016,6 +1213,11 @@ def vocab_count(text):
 
 
 def vocab_extend(project_name, symbols, model_type):
+    if model_type == HABIBI_TUN_EXP_NAME:
+        return (
+            "Vocabulary extension is disabled for F5TTS_v1_Base_TUN. Its MSA vocabulary and checkpoint embedding "
+            "must keep identical token indices."
+        )
     if symbols == "":
         return "Symbols empty!"
 
@@ -1078,15 +1280,15 @@ def vocab_extend(project_name, symbols, model_type):
     return f"vocab old size : {size_vocab}\nvocab new size : {size}\nvocab add : {vocab_size_new}\nnew symbols :\n{vocab_new}"
 
 
-def vocab_check(project_name, tokenizer_type):
+def vocab_check(project_name, tokenizer_type, model_config):
     name_project = project_name
     path_project = _safe_project_path(path_data, name_project)
 
     file_metadata = os.path.join(path_project, "metadata.csv")
 
-    file_vocab = os.path.join(path_data, "Emilia_ZH_EN_pinyin/vocab.txt")
+    file_vocab = os.path.join(path_project, "vocab.txt")
     if not os.path.isfile(file_vocab):
-        return f"the file {file_vocab} not found !", ""
+        return f"the project vocabulary {file_vocab} was not found; prepare the dataset first.", ""
 
     with open(file_vocab, "r", encoding="utf-8-sig") as f:
         data = f.read()
@@ -1115,12 +1317,18 @@ def vocab_check(project_name, tokenizer_type):
                 miss_symbols.append(t)
                 miss_symbols_keep[t] = t
 
+    config_note = ""
+    if model_config == HABIBI_TUN_EXP_NAME:
+        config_note = (
+            f"Base model config: {HABIBI_TUN_EXP_NAME} (Habibi Specialized/MSA → Tunisian, char tokenizer).\n"
+        )
+
     if miss_symbols == []:
         vocab_miss = ""
-        info = "You can train using your language !"
+        info = config_note + "You can train using your language!"
     else:
         vocab_miss = ",".join(miss_symbols)
-        info = f"The following {len(miss_symbols)} symbols are missing in your language\n\n"
+        info = config_note + f"The following {len(miss_symbols)} symbols are missing in your language\n\n"
 
     return info, vocab_miss
 
@@ -1234,7 +1442,13 @@ def get_checkpoints_project(project_name, is_gradio=True):
     project_name = project_name.replace("_pinyin", "").replace("_char", "")
 
     if os.path.isdir(path_project_ckpts):
-        files_checkpoints = glob(os.path.join(path_project_ckpts, project_name, "*.pt"))
+        checkpoint_dirs = [os.path.join(path_project_ckpts, project_name)]
+        if project_name.casefold() == HABIBI_TUN_DATASET.casefold():
+            checkpoint_dirs.insert(0, os.path.join(path_project_ckpts, HABIBI_TUN_CHECKPOINT_DIR))
+        files_checkpoints = []
+        for checkpoint_dir in checkpoint_dirs:
+            files_checkpoints.extend(glob(os.path.join(checkpoint_dir, "*.pt")))
+            files_checkpoints.extend(glob(os.path.join(checkpoint_dir, "*.safetensors")))
         # Separate pretrained and regular checkpoints
         pretrained_checkpoints = [f for f in files_checkpoints if "pretrained_" in os.path.basename(f)]
         regular_checkpoints = [
@@ -1268,7 +1482,12 @@ def get_audio_project(project_name, is_gradio=True):
     project_name = project_name.replace("_pinyin", "").replace("_char", "")
 
     if os.path.isdir(path_project_ckpts):
-        files_audios = glob(os.path.join(path_project_ckpts, project_name, "samples", "*.wav"))
+        checkpoint_dirs = [os.path.join(path_project_ckpts, project_name)]
+        if project_name.casefold() == HABIBI_TUN_DATASET.casefold():
+            checkpoint_dirs.insert(0, os.path.join(path_project_ckpts, HABIBI_TUN_CHECKPOINT_DIR))
+        files_audios = []
+        for checkpoint_dir in checkpoint_dirs:
+            files_audios.extend(glob(os.path.join(checkpoint_dir, "samples", "*.wav")))
         files_audios = sorted(files_audios, key=lambda x: int(os.path.basename(x).split("_")[1].split(".")[0]))
 
         files_audios = [item.replace("_gen.wav", "") for item in files_audios if item.endswith("_gen.wav")]
@@ -1452,19 +1671,21 @@ Skip this step if you have your dataset, metadata.csv, and a folder wavs with al
 
         with gr.TabItem("Vocab Check"):
             gr.Markdown("""```plaintext 
-Check the vocabulary for fine-tuning Emilia_ZH_EN to ensure all symbols are included. For fine-tuning a new language.
+Select the base model configuration, then check that every dataset symbol is in the project vocabulary.
+For Habibi MSA → Tunisian, choose F5TTS_v1_Base_TUN. Do not extend that vocabulary.
 ```""")
 
+            exp_name_extend = gr.Radio(
+                label="Base Model Config",
+                choices=["F5TTS_v1_Base", HABIBI_TUN_EXP_NAME, "F5TTS_Base", "E2TTS_Base"],
+                value="F5TTS_v1_Base",
+            )
             check_button = gr.Button("Check Vocab")
             txt_info_check = gr.Textbox(label="Info", value="")
 
             gr.Markdown("""```plaintext 
 Using the extended model, you can finetune to a new language that is missing symbols in the vocab. This creates a new model with a new vocabulary size and saves it in your ckpts/project folder.
 ```""")
-
-            exp_name_extend = gr.Radio(
-                label="Model", choices=["F5TTS_v1_Base", "F5TTS_Base", "E2TTS_Base"], value="F5TTS_v1_Base"
-            )
 
             with gr.Row():
                 txt_extend = gr.Textbox(
@@ -1480,7 +1701,7 @@ Using the extended model, you can finetune to a new language that is missing sym
 
             txt_extend.change(vocab_count, inputs=[txt_extend], outputs=[txt_count_symbol])
             check_button.click(
-                fn=vocab_check, inputs=[cm_project, tokenizer_type], outputs=[txt_info_check, txt_extend]
+                fn=vocab_check, inputs=[cm_project, tokenizer_type, exp_name_extend], outputs=[txt_info_check, txt_extend]
             )
             extend_button.click(
                 fn=vocab_extend, inputs=[cm_project, txt_extend, exp_name_extend], outputs=[txt_info_extend]
@@ -1539,9 +1760,15 @@ Skip this step if you have your dataset, raw.arrow, duration.json, and vocab.txt
             gr.Markdown("""```plaintext 
 The auto-setting is still experimental. Set a large value of epoch if not sure; and keep last N checkpoints if limited disk space.
 If you encounter a memory error, try reducing the batch size per GPU to a smaller number.
+
+For Habibi MSA -> Tunisian: select F5TTS_v1_Base_TUN and TunisianTTS_char, keep Tokenizer File empty,
+enable Finetune, and provide the Specialized/MSA checkpoint path (or leave it empty for download).
 ```""")
             with gr.Row():
-                exp_name = gr.Radio(label="Model", choices=["F5TTS_v1_Base", "F5TTS_Base", "E2TTS_Base"])
+                exp_name = gr.Radio(
+                    label="Model",
+                    choices=["F5TTS_v1_Base", HABIBI_TUN_EXP_NAME, "F5TTS_Base", "E2TTS_Base"],
+                )
                 tokenizer_file = gr.Textbox(label="Tokenizer File")
                 file_checkpoint_train = gr.Textbox(label="Path to the Pretrained Checkpoint")
 
@@ -1708,11 +1935,13 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
                 fn=calculate_train,
                 inputs=[
                     cm_project,
+                    exp_name,
                     epochs,
                     learning_rate,
                     batch_size_per_gpu,
                     batch_size_type,
                     max_samples,
+                    grad_accumulation_steps,
                     num_warmup_updates,
                     ch_finetune,
                 ],
@@ -1773,7 +2002,9 @@ If you encounter a memory error, try reducing the batch size per GPU to a smalle
 Check the use_ema setting (True or False) for your model to see what works best for you. Set seed to -1 for random.
 ```""")
             exp_name = gr.Radio(
-                label="Model", choices=["F5TTS_v1_Base", "F5TTS_Base", "E2TTS_Base"], value="F5TTS_v1_Base"
+                label="Model",
+                choices=["F5TTS_v1_Base", HABIBI_TUN_EXP_NAME, "F5TTS_Base", "E2TTS_Base"],
+                value=HABIBI_TUN_EXP_NAME,
             )
             list_checkpoints, checkpoint_select = get_checkpoints_project(projects_selelect, False)
 
@@ -1876,7 +2107,9 @@ Reduce the Base model size from 5GB to 1.3GB. The new checkpoint file prunes out
 def main(port, host, share, api):
     global app
     print("Starting app...")
-    app.queue(api_open=api).launch(server_name=host, server_port=port, share=share, show_api=api)
+    # ``show_api`` is not accepted by every supported Gradio release. ``api_open``
+    # controls API access, while the API documentation visibility is cosmetic.
+    app.queue(api_open=api).launch(server_name=host, server_port=port, share=share)
 
 
 if __name__ == "__main__":
