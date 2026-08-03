@@ -91,3 +91,82 @@ Moreover, if you couldn't access W&B and want to log metrics offline, you can se
 ```
 export WANDB_MODE=offline
 ```
+
+
+### 4. MLflow tracking (optional)
+
+The separate `finetune_mlflow.py` entry point adds local or remote MLflow tracking without requiring MLflow for the
+normal training commands. Install the optional dependencies from the repository root:
+
+```bash
+pip install -e ".[tracking]"
+```
+
+Enable local tracking for the Tunisian configuration with:
+
+```bash
+accelerate launch src/f5_tts/train/finetune_mlflow.py --config-name F5TTS_v1_Base_TUN.yaml \
+  mlflow.enabled=true ++ckpts.logger=null
+```
+
+The default tracking URI is `file:./mlruns`. Override `mlflow.tracking_uri` to use a remote tracking server. Training
+loss, learning rate, gradient norm, throughput, epoch/cumulative time, ETA, system metrics, resolved configuration,
+Git commit, and checkpoints are tracked. This entry point does not create a validation split, report validation loss,
+or select a best checkpoint. Set `mlflow.log_checkpoint_artifacts=false` to record checkpoint paths and metadata
+without copying the large checkpoint files into the MLflow artifact store.
+
+Inference tracking is disabled by default and never selects examples from the training dataset. To enable it, create:
+
+```text
+data/Tn_inference/
+|-- voice.wav
+`-- test.txt
+```
+
+`voice.wav` is the fixed reference voice. Put one generation prompt on each non-empty line of `test.txt`; every line
+creates one WAV and one mel-spectrogram at the configured interval. The reference audio is transcribed once by the
+existing F5-TTS ASR helper. Then run:
+
+```bash
+accelerate launch src/f5_tts/train/finetune_mlflow.py --config-name F5TTS_v1_Base_TUN.yaml \
+  mlflow.enabled=true mlflow.inference.enabled=true ++ckpts.logger=null
+```
+
+The interval defaults to `ckpts.save_per_updates` and can be changed with `mlflow.inference.every_updates=<N>`.
+Missing inference files, inference/ASR errors, and all MLflow logging failures are warnings and do not stop training.
+
+Launch the local UI from the same repository directory:
+
+```bash
+mlflow ui --backend-store-uri ./mlruns --port 5000
+```
+
+Open `http://127.0.0.1:5000` to inspect metric curves, system metrics, run parameters, checkpoint metadata/artifacts,
+and optional generated audio and mel-spectrogram artifacts.
+
+#### Accelerate memory note
+
+Running the script with `python` is a single-process run. `accelerate launch` follows your Accelerate configuration
+and may start one DDP process per GPU, which needs additional per-GPU memory for gradient communication. To match the
+single-process memory profile while still using the launcher, explicitly use one process:
+
+```bash
+accelerate launch --num_processes 1 src/f5_tts/train/finetune_mlflow.py --config-name F5TTS_v1_Base_TUN.yaml \
+  mlflow.enabled=true ++ckpts.logger=null
+```
+
+ Point the mlflow run to the database 
+```bash
+
+accelerate launch --num_processes 1 src/f5_tts/train/finetune_mlflow.py \
+  --config-name F5TTS_v1_Base_TUN.yaml \
+  mlflow.enabled=true \
+  mlflow.tracking_uri=http://127.0.0.1:5000 \
+  mlflow.log_checkpoint_artifacts=false \
+  ++ckpts.logger=null
+```
+
+The trainer enables DDP gradient views to reduce this multi-process overhead. When optional inference is enabled, it
+runs only on the main rank, synchronizes the other ranks, and releases the temporary vocoder afterward.
+
+

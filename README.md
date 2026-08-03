@@ -249,6 +249,9 @@ pre-commit run --all-files
 Note: Some model components have linting exceptions for E722 to accommodate tensor notation.
 
 
+
+
+
 ## Acknowledgements
 
 - [E2-TTS](https://arxiv.org/abs/2406.18009) brilliant work, simple and effective

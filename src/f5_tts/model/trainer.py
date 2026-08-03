@@ -3,6 +3,8 @@ from __future__ import annotations
 import gc
 import math
 import os
+import time
+from collections import deque
 
 import torch
 import torchaudio
@@ -53,8 +55,15 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
+        mlflow_tracker=None,
+        mlflow_log_every_updates: int = 10,
+        inference_callback=None,
+        inference_every_updates: int = 0,
     ):
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # DDP normally keeps a second gradient-sized communication bucket.  Make
+        # gradients views into that bucket to avoid an extra full-model buffer on
+        # each GPU when training through ``accelerate launch``.
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True, gradient_as_bucket_view=True)
 
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
@@ -134,6 +143,10 @@ class Trainer:
         self.noise_scheduler = noise_scheduler
 
         self.duration_predictor = duration_predictor
+        self.mlflow_tracker = mlflow_tracker
+        self.mlflow_log_every_updates = max(1, int(mlflow_log_every_updates))
+        self.inference_callback = inference_callback
+        self.inference_every_updates = max(0, int(inference_every_updates))
 
         if bnb_optimizer:
             import bitsandbytes as bnb
@@ -160,12 +173,14 @@ class Trainer:
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
+                checkpoint_file = f"{self.checkpoint_path}/model_last.pt"
+                self.accelerator.save(checkpoint, checkpoint_file)
                 print(f"Saved last checkpoint at update {update}")
             else:
                 if self.keep_last_n_checkpoints == 0:
                     return
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{update}.pt")
+                checkpoint_file = f"{self.checkpoint_path}/model_{update}.pt"
+                self.accelerator.save(checkpoint, checkpoint_file)
                 if self.keep_last_n_checkpoints > 0:
                     # Updated logic to exclude pretrained model from rotation
                     checkpoints = [
@@ -181,6 +196,8 @@ class Trainer:
                         oldest_checkpoint = checkpoints.pop(0)
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
+            if self.mlflow_tracker is not None:
+                self.mlflow_tracker.log_checkpoint(checkpoint_file, step=update, is_best=False)
 
     def load_checkpoint(self):
         if (
@@ -329,6 +346,11 @@ class Trainer:
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
         start_update = self.load_checkpoint()
         global_update = start_update
+        training_started_at = time.monotonic()
+        epoch_durations = deque(maxlen=5)
+        metric_window_started_at = training_started_at
+        updates_since_log = 0
+        samples_since_log = 0
 
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
@@ -340,6 +362,7 @@ class Trainer:
             skipped_epoch = 0
 
         for epoch in range(skipped_epoch, self.epochs):
+            epoch_started_at = time.monotonic()
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
@@ -361,14 +384,18 @@ class Trainer:
             )
 
             for batch in current_dataloader:
+                grad_norm = None
+                duration_loss = None
                 with self.accelerator.accumulate(self.model):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
+                    samples_since_log += len(text_inputs) * self.accelerator.num_processes
 
                     # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
+                        duration_loss = dur_loss.item()
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
                     loss, cond, pred = self.model(
@@ -377,7 +404,15 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    elif self.accelerator.sync_gradients and self.mlflow_tracker is not None and self.is_main:
+                        parameter_norms = [
+                            parameter.grad.detach().norm(2)
+                            for parameter in self.model.parameters()
+                            if parameter.grad is not None
+                        ]
+                        if parameter_norms:
+                            grad_norm = torch.stack(parameter_norms).norm(2)
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -388,8 +423,33 @@ class Trainer:
                         self.ema_model.update()
 
                     global_update += 1
+                    updates_since_log += 1
                     progress_bar.update(1)
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+
+                    if self.mlflow_tracker is not None and self.is_main:
+                        metrics = {
+                            "train/learning_rate": self.scheduler.get_last_lr()[0],
+                        }
+                        if grad_norm is not None:
+                            metrics["train/gradient_norm"] = grad_norm
+                        if duration_loss is not None:
+                            metrics["train/duration_loss"] = duration_loss
+                        if global_update % self.mlflow_log_every_updates == 0:
+                            now = time.monotonic()
+                            window_seconds = max(now - metric_window_started_at, 1e-9)
+                            metrics.update(
+                                {
+                                    "train/loss": loss.item(),
+                                    "throughput/steps_per_second": updates_since_log / window_seconds,
+                                    "throughput/samples_per_second": samples_since_log / window_seconds,
+                                    "time/elapsed_seconds": now - training_started_at,
+                                }
+                            )
+                            metric_window_started_at = now
+                            updates_since_log = 0
+                            samples_since_log = 0
+                        self.mlflow_tracker.log_metrics(metrics, step=global_update)
 
                 if self.accelerator.is_local_main_process:
                     self.accelerator.log(
@@ -436,6 +496,56 @@ class Trainer:
                             f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
                         )
                         self.model.train()
+
+                should_run_inference = (
+                    self.inference_callback is not None
+                    and self.inference_every_updates > 0
+                    and self.accelerator.sync_gradients
+                    and global_update % self.inference_every_updates == 0
+                )
+                if should_run_inference:
+                    # Keep all DDP ranks at the same update while rank zero runs
+                    # the optional, memory-intensive inference job.
+                    self.accelerator.wait_for_everyone()
+                    if self.is_main:
+                        try:
+                            inference_artifacts = self.inference_callback(
+                                self.accelerator.unwrap_model(self.model),
+                                global_update,
+                                self.accelerator,
+                            )
+                            if self.mlflow_tracker is not None:
+                                for artifact in inference_artifacts:
+                                    self.mlflow_tracker.log_audio_sample(
+                                        artifact["audio_path"], global_update, artifact["sample_rate"]
+                                    )
+                                    self.mlflow_tracker.log_mel_spectrogram(artifact["spectrogram_path"], global_update)
+                                self.mlflow_tracker.log_metrics(
+                                    {"inference/generated_samples": len(inference_artifacts)}, step=global_update
+                                )
+                        except Exception as error:
+                            print(f"Optional MLflow inference warning at update {global_update}: {error}")
+                            if self.mlflow_tracker is not None:
+                                self.mlflow_tracker.log_metrics({"inference/failures": 1}, step=global_update)
+                        finally:
+                            self.model.train()
+                    self.accelerator.wait_for_everyone()
+
+            epoch_seconds = time.monotonic() - epoch_started_at
+            epoch_durations.append(epoch_seconds)
+            cumulative_seconds = time.monotonic() - training_started_at
+            recent_average = sum(epoch_durations) / len(epoch_durations)
+            remaining_epochs = max(self.epochs - (epoch + 1), 0)
+            if self.mlflow_tracker is not None and self.is_main:
+                self.mlflow_tracker.log_epoch_time(epoch + 1, epoch_seconds)
+                self.mlflow_tracker.log_metrics(
+                    {
+                        "time/cumulative_seconds": cumulative_seconds,
+                        "time/eta_seconds": recent_average * remaining_epochs,
+                        "progress/epoch": epoch + 1,
+                    },
+                    step=global_update,
+                )
 
         self.save_checkpoint(global_update, last=True)
 

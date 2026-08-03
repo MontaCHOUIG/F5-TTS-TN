@@ -4,13 +4,15 @@ hydra:
 
 datasets:
   name: TunisianTTS
-  batch_size_per_gpu: 4500
+  # Conservative starting point for one 32 GB GPU. Increase only after observing VRAM headroom.
+  batch_size_per_gpu: 9600
   batch_size_type: frame
   max_samples: 64
-  num_workers: 16
+  num_workers: 12
 
 optim:
-  epochs: 1
+  # Safety placeholder: replace with the result from count_tunisian_epochs.py before the real run.
+  epochs: 100
   learning_rate: 7.5e-5
   num_warmup_updates: 20000
   grad_accumulation_steps: 1
@@ -22,7 +24,6 @@ model:
   tokenizer: char
   tokenizer_path: null
   backbone: DiT
-
   # Must remain shape-compatible with Habibi-TTS Specialized/MSA.
   arch:
     dim: 1024
@@ -54,7 +55,27 @@ ckpts:
   wandb_run_name: ${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
   wandb_resume_id: null
   log_samples: True
-  save_per_updates: 5000
+  save_per_updates: 50000
   keep_last_n_checkpoints: -1
   last_per_updates: 5000
   save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
+
+mlflow:
+  enabled: false
+  tracking_uri: file:./mlruns
+  experiment_name: f5-tts-finetune
+  run_name: null
+  log_every_updates: 500
+  log_system_metrics: true
+  log_checkpoint_artifacts: true
+  inference:
+    enabled: false
+    directory: data/Tn_inference
+    every_updates: ${ckpts.save_per_updates}
+    nfe_step: 32
+    cfg_strength: 2.0
+    sway_sampling_coef: -1.0
+    speed: 1.0
+    seed: 666
+    # Frees the inference vocoder after each sample interval to protect training VRAM.
+    release_vocoder_after_run: true
