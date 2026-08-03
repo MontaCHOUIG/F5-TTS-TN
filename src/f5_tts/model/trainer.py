@@ -123,6 +123,7 @@ class Trainer:
                 )
 
         self.epochs = epochs
+        self.learning_rate = learning_rate
         self.num_warmup_updates = num_warmup_updates
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
@@ -351,6 +352,13 @@ class Trainer:
         metric_window_started_at = training_started_at
         updates_since_log = 0
         samples_since_log = 0
+        frames_since_log = 0
+        best_train_loss = float("inf")
+        loss_window = deque(maxlen=self.mlflow_log_every_updates)
+        accumulated_samples = 0
+        accumulated_frames = 0
+        accumulated_loss = 0.0
+        accumulation_microbatches = 0
 
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
@@ -363,6 +371,8 @@ class Trainer:
 
         for epoch in range(skipped_epoch, self.epochs):
             epoch_started_at = time.monotonic()
+            epoch_loss_sum = 0.0
+            epoch_updates = 0
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
@@ -390,7 +400,8 @@ class Trainer:
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
-                    samples_since_log += len(text_inputs) * self.accelerator.num_processes
+                    accumulated_samples += len(text_inputs)
+                    accumulated_frames += int(mel_lengths.sum().item())
 
                     # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
@@ -401,6 +412,8 @@ class Trainer:
                     loss, cond, pred = self.model(
                         mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
                     )
+                    accumulated_loss += loss.detach().item()
+                    accumulation_microbatches += 1
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -419,17 +432,55 @@ class Trainer:
                     self.optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
+                    mean_loss = self.accelerator.reduce(
+                        torch.tensor(
+                            accumulated_loss / max(accumulation_microbatches, 1), device=self.accelerator.device
+                        ),
+                        reduction="mean",
+                    ).item()
+                    global_samples = int(
+                        self.accelerator.reduce(
+                            torch.tensor(accumulated_samples, device=self.accelerator.device), reduction="sum"
+                        ).item()
+                    )
+                    global_frames = int(
+                        self.accelerator.reduce(
+                            torch.tensor(accumulated_frames, device=self.accelerator.device), reduction="sum"
+                        ).item()
+                    )
+                    accumulated_samples = 0
+                    accumulated_frames = 0
+                    accumulated_loss = 0.0
+                    accumulation_microbatches = 0
+
                     if self.is_main:
                         self.ema_model.update()
 
                     global_update += 1
                     updates_since_log += 1
+                    samples_since_log += global_samples
+                    frames_since_log += global_frames
+                    loss_window.append(mean_loss)
+                    best_train_loss = min(best_train_loss, mean_loss)
+                    epoch_loss_sum += mean_loss
+                    epoch_updates += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+                    progress_bar.set_postfix(update=str(global_update), loss=mean_loss)
 
                     if self.mlflow_tracker is not None and self.is_main:
+                        applied_learning_rate = float(self.optimizer.param_groups[0]["lr"])
                         metrics = {
-                            "train/learning_rate": self.scheduler.get_last_lr()[0],
+                            "train/loss": mean_loss,
+                            "train/learning_rate": applied_learning_rate,
+                            "train/learning_rate_ratio": applied_learning_rate / self.learning_rate,
+                            "scheduler/warmup_progress": min(global_update / max(warmup_updates, 1), 1.0),
+                            "scheduler/decay_progress": min(
+                                max(global_update - warmup_updates, 0) / max(decay_updates, 1), 1.0
+                            ),
+                            "progress/epoch": epoch + 1,
+                            "batch/global_samples": global_samples,
+                            "batch/global_frames": global_frames,
+                            "batch/mean_frames_per_sample": global_frames / max(global_samples, 1),
                         }
                         if grad_norm is not None:
                             metrics["train/gradient_norm"] = grad_norm
@@ -440,15 +491,18 @@ class Trainer:
                             window_seconds = max(now - metric_window_started_at, 1e-9)
                             metrics.update(
                                 {
-                                    "train/loss": loss.item(),
+                                    "train/loss_window_mean": sum(loss_window) / len(loss_window),
+                                    "train/loss_best": best_train_loss,
                                     "throughput/steps_per_second": updates_since_log / window_seconds,
                                     "throughput/samples_per_second": samples_since_log / window_seconds,
+                                    "throughput/frames_per_second": frames_since_log / window_seconds,
                                     "time/elapsed_seconds": now - training_started_at,
                                 }
                             )
                             metric_window_started_at = now
                             updates_since_log = 0
                             samples_since_log = 0
+                            frames_since_log = 0
                         self.mlflow_tracker.log_metrics(metrics, step=global_update)
 
                 if self.accelerator.is_local_main_process:
@@ -540,6 +594,8 @@ class Trainer:
                 self.mlflow_tracker.log_epoch_time(epoch + 1, epoch_seconds)
                 self.mlflow_tracker.log_metrics(
                     {
+                        "train/epoch_loss": epoch_loss_sum / max(epoch_updates, 1),
+                        "train/epoch_updates": epoch_updates,
                         "time/cumulative_seconds": cumulative_seconds,
                         "time/eta_seconds": recent_average * remaining_epochs,
                         "progress/epoch": epoch + 1,

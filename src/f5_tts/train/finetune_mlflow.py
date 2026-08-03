@@ -244,7 +244,7 @@ def main(model_cfg) -> None:
     mlflow_cfg = model_cfg.get("mlflow", {})
     use_mlflow = bool(mlflow_cfg.get("enabled", False))
     tracker = MLflowTracker(
-        tracking_uri=str(mlflow_cfg.get("tracking_uri", "file:./mlruns")),
+        tracking_uri=str(mlflow_cfg.get("tracking_uri", "sqlite:///mlflow.db")),
         enabled=use_mlflow,
         log_system_metrics=bool(mlflow_cfg.get("log_system_metrics", True)),
         log_checkpoint_artifacts=bool(mlflow_cfg.get("log_checkpoint_artifacts", True)),
@@ -307,6 +307,16 @@ def main(model_cfg) -> None:
             OmegaConf.to_container(model_cfg, resolve=True),
             run_name=mlflow_cfg.get("run_name", None),
             experiment_name=str(mlflow_cfg.get("experiment_name", "f5-tts-finetune")),
+        )
+        tracker.log_params(
+            {
+                "model": {
+                    "total_parameters": sum(parameter.numel() for parameter in model.parameters()),
+                    "trainable_parameters": sum(
+                        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+                    ),
+                }
+            }
         )
 
     try:

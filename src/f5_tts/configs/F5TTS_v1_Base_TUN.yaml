@@ -5,10 +5,10 @@ hydra:
 datasets:
   name: TunisianTTS
   # Conservative starting point for one 32 GB GPU. Increase only after observing VRAM headroom.
-  batch_size_per_gpu: 9600
+  batch_size_per_gpu: 9800
   batch_size_type: frame
   max_samples: 64
-  num_workers: 12
+  num_workers: 8
 
 optim:
   # Safety placeholder: replace with the result from count_tunisian_epochs.py before the real run.
